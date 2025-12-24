@@ -5,8 +5,27 @@ import { fal } from '@fal-ai/client';
 
 // Configure fal client to use the proxy
 fal.config({
-  proxyUrl: "/api/fal/proxy",
+  proxyUrl: '/api/fal/proxy',
 });
+
+// Model configurations
+const MODELS = {
+  veo2: {
+    id: 'fal-ai/veo2/image-to-video',
+    name: 'Veo 2 (Google)',
+    description: 'Google의 Veo 2 모델 - 빠른 생성',
+  },
+  'wan2.6': {
+    id: 'wan/v2.6/image-to-video',
+    name: 'WAN 2.6',
+    description: '720p/1080p, 5-15초, 멀티샷 지원',
+  },
+} as const;
+
+type ModelKey = keyof typeof MODELS;
+
+const QUEUE_POLL_INTERVAL_MS = 8000;
+const PROGRESS_POLL_INTERVAL_MS = 5000;
 
 type QueueStatus = {
   status: 'IN_QUEUE' | 'IN_PROGRESS' | 'COMPLETED' | 'FAILED';
@@ -22,6 +41,7 @@ type VideoResponse = {
   };
 };
 
+
 export default function VideoGenerator() {
   const [image, setImage] = useState<File | null>(null);
   const [prompt, setPrompt] = useState('');
@@ -30,6 +50,16 @@ export default function VideoGenerator() {
   const [error, setError] = useState<string | null>(null);
   const [progress, setProgress] = useState<string>('');
   const pollingTimeoutRef = useRef<NodeJS.Timeout | undefined>(undefined);
+
+  // Model selection state
+  const [selectedModel, setSelectedModel] = useState<ModelKey>('veo2');
+
+  // WAN 2.6 specific options
+  const [resolution, setResolution] = useState<'720p' | '1080p'>('1080p');
+  const [duration, setDuration] = useState<'5' | '10' | '15'>('5');
+  const [enablePromptExpansion, setEnablePromptExpansion] = useState(true);
+  const [multiShots, setMultiShots] = useState(false);
+  const [negativePrompt, setNegativePrompt] = useState('');
 
   // Cleanup polling on unmount
   useEffect(() => {
@@ -48,28 +78,40 @@ export default function VideoGenerator() {
     }
   };
 
-  const fetchResult = async (id: string): Promise<VideoResponse> => {
-    return fal.queue.result('fal-ai/veo2/image-to-video', {
+  const getModelId = (model: ModelKey) => MODELS[model].id;
+
+  const fetchResult = async (
+    id: string,
+    model: ModelKey
+  ): Promise<VideoResponse> => {
+    return fal.queue.result(getModelId(model), {
       requestId: id,
     });
   };
 
-  const checkStatus = async (id: string) => {
+  const fetchStatus = async (
+    id: string,
+    model: ModelKey
+  ): Promise<QueueStatus> => {
+    return fal.queue.status(getModelId(model), {
+      requestId: id,
+      logs: true,
+    }) as QueueStatus;
+  };
+
+  const checkStatus = async (id: string, model: ModelKey) => {
     try {
       console.log('Checking status for request:', id);
-      const status = await fal.queue.status('fal-ai/veo2/image-to-video', {
-        requestId: id,
-        logs: true,
-      }) as QueueStatus;
+      const status = await fetchStatus(id, model);
 
       console.log('Received status:', status);
 
       if (status.status === 'COMPLETED') {
         console.log('Generation completed, fetching result...');
         try {
-          const response = await fetchResult(id);
+          const response = await fetchResult(id, model);
           console.log('Received result:', response);
-          
+
           if (response.data?.video?.url) {
             setVideoUrl(response.data.video.url);
             setIsGenerating(false);
@@ -94,9 +136,18 @@ export default function VideoGenerator() {
       } else if (status.status === 'IN_PROGRESS' || status.status === 'IN_QUEUE') {
         const lastLog = status.logs?.[status.logs.length - 1]?.message;
         console.log('Still processing, last log:', lastLog);
-        setProgress(lastLog || 'Processing...');
-        // Check again in 5 seconds
-        pollingTimeoutRef.current = setTimeout(() => checkStatus(id), 5000);
+        setProgress(
+          lastLog ||
+            (status.status === 'IN_QUEUE' ? 'Queued for processing...' : 'Processing...')
+        );
+        const nextDelay =
+          status.status === 'IN_QUEUE'
+            ? QUEUE_POLL_INTERVAL_MS
+            : PROGRESS_POLL_INTERVAL_MS;
+        pollingTimeoutRef.current = setTimeout(
+          () => checkStatus(id, model),
+          nextDelay
+        );
       } else {
         console.error('Unknown status:', status.status);
         setError('Received unknown status from server');
@@ -128,23 +179,40 @@ export default function VideoGenerator() {
     setProgress('Uploading image...');
 
     try {
-      // Upload the image first
+      const modelKey = selectedModel;
       const imageUrl = await fal.storage.upload(image);
       setProgress('Starting video generation...');
 
-      // Submit to queue
-      const { request_id } = await fal.queue.submit('fal-ai/veo2/image-to-video', {
-        input: {
+      let input: Record<string, unknown>;
+
+      if (modelKey === 'wan2.6') {
+        input = {
+          prompt,
+          image_url: imageUrl,
+          resolution,
+          duration,
+          enable_prompt_expansion: enablePromptExpansion,
+          multi_shots: multiShots,
+          ...(negativePrompt.trim().length > 0 && {
+            negative_prompt: negativePrompt,
+          }),
+        };
+      } else {
+        input = {
           prompt,
           image_url: imageUrl,
           aspect_ratio: '16:9',
-          duration: '5s'
-        }
+          duration: '5s',
+        };
+      }
+
+      const { request_id } = await fal.queue.submit(getModelId(modelKey), {
+        input,
       });
 
       console.log('Submitted request with ID:', request_id);
       // Start checking status
-      checkStatus(request_id);
+      checkStatus(request_id, modelKey);
     } catch (err) {
       console.error('Error submitting request:', err);
       setError(err instanceof Error ? err.message : 'Failed to generate video');
@@ -156,6 +224,25 @@ export default function VideoGenerator() {
   return (
     <div className="max-w-2xl mx-auto p-6">
       <form onSubmit={handleSubmit} className="space-y-6">
+        {/* Model Selection */}
+        <div>
+          <label className="block text-sm font-medium mb-2">
+            Model
+          </label>
+          <select
+            value={selectedModel}
+            onChange={(e) => setSelectedModel(e.target.value as ModelKey)}
+            className="w-full p-2 border rounded-md bg-white dark:bg-black"
+            disabled={isGenerating}
+          >
+            {Object.entries(MODELS).map(([key, model]) => (
+              <option key={key} value={key}>
+                {model.name} - {model.description}
+              </option>
+            ))}
+          </select>
+        </div>
+
         <div>
           <label className="block text-sm font-medium mb-2">
             Upload Image
@@ -186,6 +273,78 @@ export default function VideoGenerator() {
             disabled={isGenerating}
           />
         </div>
+
+        {/* WAN 2.6 Specific Options */}
+        {selectedModel === 'wan2.6' && (
+          <div className="space-y-4 p-4 bg-gray-50 dark:bg-black rounded-md">
+            <h3 className="font-medium text-sm text-gray-700">WAN 2.6 Options</h3>
+
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <label className="block text-sm font-medium mb-1">Resolution</label>
+                <select
+                  value={resolution}
+                  onChange={(e) => setResolution(e.target.value as '720p' | '1080p')}
+                  className="w-full p-2 border rounded-md bg-white dark:bg-black"
+                  disabled={isGenerating}
+                >
+                  <option value="720p">720p</option>
+                  <option value="1080p">1080p</option>
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium mb-1">Duration</label>
+                <select
+                  value={duration}
+                  onChange={(e) => setDuration(e.target.value as '5' | '10' | '15')}
+                  className="w-full p-2 border rounded-md bg-white dark:bg-black"
+                  disabled={isGenerating}
+                >
+                  <option value="5">5 seconds</option>
+                  <option value="10">10 seconds</option>
+                  <option value="15">15 seconds</option>
+                </select>
+              </div>
+            </div>
+
+            <div>
+              <label className="block text-sm font-medium mb-1">Negative Prompt (optional)</label>
+              <input
+                type="text"
+                value={negativePrompt}
+                onChange={(e) => setNegativePrompt(e.target.value)}
+                placeholder="e.g., low quality, blurry, distorted"
+                className="w-full p-2 border rounded-md"
+                disabled={isGenerating}
+              />
+            </div>
+
+            <div className="flex gap-6">
+              <label className="flex items-center gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  checked={enablePromptExpansion}
+                  onChange={(e) => setEnablePromptExpansion(e.target.checked)}
+                  disabled={isGenerating}
+                  className="rounded"
+                />
+                Prompt Expansion (LLM 활용)
+              </label>
+
+              <label className="flex items-center gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  checked={multiShots}
+                  onChange={(e) => setMultiShots(e.target.checked)}
+                  disabled={isGenerating || !enablePromptExpansion}
+                  className="rounded"
+                />
+                Multi-shot
+              </label>
+            </div>
+          </div>
+        )}
 
         <button
           type="submit"
